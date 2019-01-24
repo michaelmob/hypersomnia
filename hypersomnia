@@ -1,0 +1,1450 @@
+#!/usr/bin/env bash
+#
+# https://github.com/thetarkus/hypersomnia
+#  _   _                                                 _
+# | | | |_   _ _ __   ___ _ __ ___  ___  _ __ ___  _ __ (_) __ _
+# | |_| | | | | '_ \ / _ \ '__/ __|/ _ \| '_ ` _ \| '_ \| |/ _` |
+# |  _  | |_| | |_) |  __/ |  \__ \ (_) | | | | | | | | | | (_| |
+# |_| |_|\__, | .__/ \___|_|  |___/\___/|_| |_| |_|_| |_|_|\__,_|
+#        |___/|_|
+#
+
+version='0.1.0'
+__name="\e[1;4mHypersomnia $version\e[0m"
+
+
+
+#
+# Configuration.
+#
+
+: ${HS_CONFIG_PATH:=$HOME/.config/hypersomnia}
+: ${HS_CONFIG_FILE:=$HS_CONFIG_PATH/config}
+
+# Source configuration file.
+if [[ -z "$HS_DEBUG" ]] && [[ "$1" != '--options' ]]; then
+  [[ -f "$HS_CONFIG_FILE" ]] && source "$HS_CONFIG_FILE"
+fi
+
+# Cache files.
+: ${HS_CACHE_PATH:=$HOME/.cache/hypersomnia}
+mkdir -p "$HS_CACHE_PATH" && cd "$HS_CACHE_PATH"
+
+
+
+#
+# Settings.
+#
+
+: ${HS_PID_FILE:=hypersomnia.pid}
+: ${HS_TEMP_PID_FILE:=temp.pid}
+: ${HS_MONITOR_PID_FILE:=monitor.pid}
+: ${HS_XGETIDLE_PID_FILE:=xgetidle.pid}
+
+: ${HS_RUN_MESSAGE_FILE:=run_message}
+: ${HS_PAUSE_FILE:=pause}
+: ${HS_SLEEP_FILE:=sleep}
+
+: ${HS_NOTIFY_SECONDS:=60 30}
+: ${HS_LOCK_SECONDS:=120 60}
+: ${HS_SCREEN_OFF_SECONDS:=125 60}
+: ${HS_SLEEP_SECONDS:=300 180}
+
+: ${HS_LOCK_PROCESS_NAME:=i3lock}
+: ${HS_LOCK_PAUSE_PROCESS_NAMES:=dunst}
+
+: ${HS_NOTIFY_COMMAND:=}
+: ${HS_LOCK_COMMAND:=i3lock -c 000000}
+: ${HS_UNLOCK_COMMAND:=pkill $HS_LOCK_PROCESS_NAME}
+: ${HS_SCREEN_OFF_COMMAND:=xset dpms force off}
+: ${HS_SLEEP_COMMAND:=systemctl suspend}
+: ${HS_RESUME_COMMAND:=xset dpms force on}
+
+: ${HS_NOTIFY_STYLE:=dim}
+: ${HS_NOTIFY_DIM_MILLISECONDS:=10000}
+: ${HS_NOTIFY_DIM_LEVEL:=-50 5}
+: ${HS_NOTIFY_FADE_LEVEL:=1}
+: ${HS_NOTIFY_MESSAGE:=Locking screen in % seconds.}
+: ${HS_NOTIFY_MESSAGE_MILLISECONDS:=5000}
+
+: ${HS_PAUSE_MESSAGE_MILLISECONDS:=$HS_NOTIFY_MESSAGE_MILLISECONDS}
+
+: ${HS_CHARGING_WATCH_INTERVAL:=30}
+: ${HS_CHARGING_WATCH_FILE:=/sys/class/power_supply/AC/online}
+: ${HS_CHARGING_WATCH_VALUE:=0}
+: ${HS_CHARGING_WATCH_PID_FILE:=watch.pid}
+
+: ${HS_BRIGHTNESS_FILE:=brightness}
+: ${HS_BRIGHTNESS_LOCK:=$HS_BRIGHTNESS_FILE-lock}
+: ${HS_BRIGHTNESS_STEPS:=20}
+: ${HS_BRIGHTNESS_PAUSE_PROCESS_NAMES:=redshift}
+
+: ${HS_LOCK_ON_SLEEP:=true}
+: ${HS_INHIBITORS:=fullscreen}
+
+: ${HS_NOTIFY_INHIBITORS:=}
+: ${HS_LOCK_INHIBITORS:=}
+: ${HS_SCREEN_OFF_INHIBITORS:=}
+: ${HS_SLEEP_INHIBITORS:=cpu network}
+
+: ${HS_INHIBIT_CPU_VALUE:=50}
+: ${HS_INHIBIT_NETWORK_VALUE:=1000000}
+: ${HS_INHIBIT_CUSTOM_COMMAND:=}
+
+: ${HS_NETWORK_DEVICE:=$(ip addr | awk '/state UP/ { print $2; exit }')}
+
+
+
+#
+# Script settings.
+#
+
+declare -A timers=([notify]= [lock]= [screen_off]= [sleep]=)
+battery_status=0
+use_xbacklight="$(xbacklight 2> /dev/null)"
+net_stats_path="/sys/class/net/${HS_NETWORK_DEVICE%:}/statistics"
+tx_bytes_file="$net_stats_path/tx_bytes"
+rx_bytes_file="$net_stats_path/rx_bytes"
+
+
+
+#
+# Helper functions.
+#
+
+echo_timestamp() {
+  #
+  # Echo arguments with timestamp.
+  #
+  echo "[$(date +%H:%M:%S)] $@"
+  logger -p user.info "(Hypersomnia) $@"
+}
+
+
+get_running_pids() {
+  #
+  # Get process IDs of already running Hypersomnia and friends.
+  #
+  local result=$(pgrep -o -f 'bash (\S+)hypersomnia') && echo ${result//$$/}
+}
+
+
+get_cpu_utilization() {
+  #
+  # Get the CPU's utilization percentage from top.
+  #
+  p=($(awk '/cpu /{print $2+$4,$2+$4+$5}' /proc/stat)); sleep 1
+  awk "/cpu /{x=\$2+\$4;print (x-${p[0]})/(x+\$5-${p[1]})*100}" /proc/stat
+}
+
+
+get_network_rate() {
+  #
+  # Combine Tx rate and Rx rate to get network bytes/sec.
+  #
+  [[ "$HS_NETWORK_DEVICE" ]] || return 1
+
+  previous_tx_bytes=$(<"$tx_bytes_file")
+  previous_rx_bytes=$(<"$rx_bytes_file")
+  sleep 1
+  current_tx_bytes=$(<"$tx_bytes_file")
+  current_rx_bytes=$(<"$rx_bytes_file")
+
+  tx_bytes=$((current_tx_bytes - previous_tx_bytes))
+  rx_bytes=$((current_rx_bytes - previous_rx_bytes))
+  echo $((tx_bytes + rx_bytes))
+}
+
+
+get_battery_status() {
+  #
+  # Get battery charging status and set `$battery_status`.
+  #
+  (( $HS_CHARGING_WATCH_INTERVAL > 0 )) && \
+    [[ -f "$HS_CHARGING_WATCH_FILE" ]] && \
+    [[ "$(<"$HS_CHARGING_WATCH_FILE")" = "$HS_CHARGING_WATCH_VALUE" ]] && \
+    battery_status=1
+}
+
+
+send_signal() {
+  #
+  # Send signal to process.
+  #
+  [[ "$1" ]] || return
+  for process in "$1"; do
+    pid=$(pidof "$process")
+    [[ -z "$pid" ]] || kill -s $2 $pid > /dev/null 2>&1
+  done
+}
+
+
+timestamp_to_seconds() {
+  #
+  # Timestamp to seconds.
+  # (01:01:01; 1 hour, 1 minute, 1 second)
+  #
+  local value=(${1//:/ })
+  local count="${1//[^:]}"
+  local seconds=0
+
+  case "${#count}" in
+    # Minutes.
+    0) seconds=$((value[0] * 60)) ;;
+
+    # Hours and minutes.
+    1) seconds=$((value[0] * 3600 + value[1] * 60)) ;;
+
+    # Hours, minutes, and seconds.
+    2) seconds=$((value[0] * 3600 + value[1] * 60 + value[2])) ;;
+  esac
+
+  echo $seconds
+}
+
+
+
+#
+# Task functions.
+#
+
+is_window_fullscreen() {
+  #
+  # Test if window is fullscreen.
+  #
+  local active_window=$(xdotool getactivewindow)
+  [[ "$active_window" ]] || return 1
+  xwininfo -id $active_window -wm | grep -cP '\s{8}Fullscreen' > /dev/null
+}
+
+
+is_audio_playing() {
+  #
+  # Test if audio is playing.
+  #
+  cat /proc/asound/card*/pcm*/sub*/status | grep -c RUNNING > /dev/null
+}
+
+
+is_cpu_busy() {
+  #
+  # Test if CPU is under load.
+  #
+  [[ "$HS_INHIBIT_CPU_VALUE" != 0 ]] && \
+    cpu=$(get_cpu_utilization) && \
+    (( "${cpu%%.*}" >= "$HS_INHIBIT_CPU_VALUE" ))
+}
+
+
+is_network_busy() {
+  #
+  # Test if network is busy.
+  #
+  [[ "$HS_INHIBIT_NETWORK_VALUE" != 0 ]] && \
+    local rate="$(get_network_rate)" && \
+    [[ $rate ]] && (( rate >= "$HS_INHIBIT_NETWORK_VALUE" ))
+}
+
+
+is_command_successful() {
+  #
+  # Test if command returns success status.
+  #
+  [[ -n "$HS_INHIBIT_CUSTOM_COMMAND" ]] && \
+    ($HS_INHIBIT_CUSTOM_COMMAND > /dev/null)
+}
+
+
+is_paused() {
+  #
+  # Test if Hypersomnia is paused.
+  #
+  [[ -f "$HS_PAUSE_FILE" ]] && {
+    local data=($(<"$HS_PAUSE_FILE"))
+    (( $(date +%s) > ${data[0]} )) && echo 'unpaused' && return 1
+    echo ${data[@]:1}
+  } || return 1
+}
+
+
+is_inhibited() {
+  #
+  # Test for inhibition indicators.
+  #
+  for inhibitor in "$@"; do
+    case "$inhibitor" in
+      # Inhibit when custom's command is successful.
+      custom)
+        is_command_successful && echo 'Inhibited (Custom)' && return 0
+        ;;
+
+      # Inhibit when active window is fullscreen.
+      fullscreen)
+        is_window_fullscreen && echo 'Inhibited (Fullscreen)' && return 0
+        ;;
+
+      # Inhibit when audio playing.
+      audio)
+        is_audio_playing && echo 'Inhibited (Audio)' && return 0
+        ;;
+
+      # Inhibit when CPU utilization is at or above a value.
+      cpu)
+        is_cpu_busy && echo 'Inhibited (CPU)' && return 0
+        ;;
+
+      # Inhibit when network traffic is active at or above a value.
+      network)
+        is_network_busy && echo 'Inhibited (Network)' && return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+set_pause() {
+  #
+  # Pause or unpause Hypersomnia for a duration.
+  #     $1 -> pause duration; set to zero to unpause.
+  #
+  seconds=$(timestamp_to_seconds "$1")
+
+  # Pause.
+  if (( seconds > 0 )); then
+    local h=$(($seconds/3600))
+    local m=$(($seconds%3600/60))
+    local s=$(($seconds%60))
+
+    pause_until=$(($(date +%s) + seconds))
+    echo "$pause_until ${@:2}" > "$HS_PAUSE_FILE"
+    echo -e "$__name"
+    printf 'paused for:   %d hours, %d minutes, %d seconds\n' $h $m $s
+    echo 'paused until:' $(date -d @$pause_until)
+    run_hook 'pause' 'pause'
+
+    (( $HS_PAUSE_MESSAGE_MILLISECONDS > 0 )) && \
+      notify-send -t $HS_PAUSE_MESSAGE_MILLISECONDS \
+        "Hypersomnia has been paused for ${h}h ${m}m ${s}s."
+
+  # Unpause.
+  else
+    rm -f "$HS_PAUSE_FILE" > /dev/null 2>&1
+    echo -e "$__name\nunpaused"
+    run_hook 'pause' 'unpause-manual'
+
+    (( $HS_PAUSE_MESSAGE_MILLISECONDS > 0 )) && \
+      notify-send -t $HS_PAUSE_MESSAGE_MILLISECONDS \
+        "Hypersomnia has been manually unpaused."
+  fi
+}
+
+
+kill_temp_jobs() {
+  #
+  # Kill temporary jobs.
+  #
+  [[ -f "$HS_TEMP_PID_FILE" ]] || return
+  local pids="$(<"$HS_TEMP_PID_FILE")"
+  rm -f "$HS_TEMP_PID_FILE"
+  kill ${pids/$BASHPID} > /dev/null 2>&1
+}
+
+
+get_brightness() {
+  #
+  # Get brightness of primary display.
+  #     $1 -> method. (xrandr or xbacklight)
+  #
+
+  # Get backlight brightness from xbacklight.
+  if [[ $use_xbacklight ]]; then
+    xbacklight -get
+
+  # Get fake brightness from xrandr.
+  else
+    local verbose="$(xrandr --verbose)"
+    local pattern='Brightness: \K(.*?)$'
+
+    # Get primary display.
+    percent="$(echo "$verbose" |
+      grep -A 10 -e ' connected primary' | grep -oP "$pattern")"
+
+    # Primary display is not connected, use first connected display.
+    [[ -z "$percent" ]] && \
+      percent="$(echo "$verbose" |
+      grep -A 10 -e ' connected' | grep -oP "$pattern")"
+
+    # Multiply by 100.
+    echo "$percent*100" | bc
+  fi
+}
+
+
+set_brightness() {
+  #
+  # Set brightness of primary display.
+  #     $1 -> percentage to fade to.
+  #     $2 -> fade time in milliseconds.
+  #
+
+  # Check for lock file and kill other brightness jobs.
+  if [[ -f "$HS_BRIGHTNESS_LOCK" ]]; then
+    rm -f "$HS_BRIGHTNESS_LOCK"
+    kill_temp_jobs
+  fi
+
+  # Fork self.
+  if [[ -z $FORK ]]; then
+    FORK=1 set_brightness $@ &
+    echo -n "$! " >> "$HS_TEMP_PID_FILE"
+    wait
+    return
+  fi
+
+  # Create lock file.
+  echo > "$HS_BRIGHTNESS_LOCK"
+  trap "rm -f '$HS_BRIGHTNESS_LOCK';
+    send_signal '$HS_BRIGHTNESS_PAUSE_PROCESS_NAMES' CONT" RETURN EXIT SIGUSR1
+
+  # Get percentages.
+  to_percent=${1%.*}
+  from_percent="$(get_brightness)"
+  from_percent=${from_percent%.*}
+  [[ "$from_percent" ]] || { echo 'Could not get brightness.' && return; }
+  (( $to_percent < 0 )) && to_percent=$(( $to_percent + $from_percent ))
+  (( $to_percent < 0 )) && to_percent=1
+  (( $from_percent == $to_percent )) && return 1
+
+  # Fade time.
+  fade_time="${2:-1000}"
+
+  # Calculate steps.
+  [[ -n $HS_BRIGHTNESS_FIXED_STEPS ]] && \
+    steps="$HS_BRIGHTNESS_FIXED_STEPS" || \
+    steps="$(echo "$fade_time/1000*$HS_BRIGHTNESS_STEPS" | bc -l)"
+
+  # Write previous brightness to file when decreasing.
+  (( $to_percent <= $from_percent )) && \
+    echo "$from_percent" > "$HS_BRIGHTNESS_FILE"
+
+  # Toggle processes while brightness is being changed.
+  send_signal "$HS_BRIGHTNESS_PAUSE_PROCESS_NAMES" STOP
+
+  # Set brightness of backlight with xbacklight.
+  if [[ $use_xbacklight ]]; then
+    xbacklight -set $to_percent -time $fade_time -steps $steps
+
+  # Set fake brightness with xrandr.
+  else
+    primary_display="$(xrandr | awk '/ connected primary/{print $1; exit}')"
+
+    # Primary display not connected, use first connected display.
+    [[ "$primary_display" ]] || \
+      primary_display="$(xrandr | awk '/ connected/{print $1; exit}')"
+
+    if [[ $steps = 0 ]] || [[ $fade_time = 1 ]]; then
+      to_percent="$(echo "$to_percent/100" | bc -l)"
+      values=$(echo -e "0\n$to_percent")
+    else
+      # Calculate fade values.
+      values=$(echo "f=$from_percent/100;t=$to_percent/100;s=$steps;
+        d=(t-f)/s;$fade_time/1000/s;for(i=s-1;i>0;i--){f+=d;f};t" | bc -l)
+    fi
+
+    # Create fade effect.
+    while read -r line; do
+      #echo $line
+      [[ -z $seconds ]] && seconds="$line" && continue
+      xrandr --output "$primary_display" --brightness $line &
+      sleep $seconds
+    done <<< "$values"
+    unset seconds
+  fi
+
+}
+
+
+restore_brightness() {
+  #
+  # Restore brightness to previous percent.
+  #     $1 -> 
+  #
+  [[ -f "$HS_BRIGHTNESS_FILE" ]] && \
+    percent="$(<"$HS_BRIGHTNESS_FILE")"
+  [[ "$percent" ]] || return
+  set_brightness $percent $1
+  rm -f "$HS_BRIGHTNESS_FILE"
+}
+
+
+run_hook() {
+  #
+  # Run hook from hooks directory in configuration path.
+  #
+  local file="$HS_CONFIG_PATH/hooks/$1.sh"
+  [[ -f "$file" ]] && bash $file ${@:2}
+}
+
+
+run_restore() {
+  #
+  # Run restore from inactivity.
+  #
+  echo_timestamp 'Restore'
+  kill_temp_jobs
+
+  run_hook 'restore' 'pre'
+  restore_brightness
+  run_hook 'restore' 'post'
+}
+
+
+run_notify() {
+  #
+  # Run notify command.
+  #
+  echo_timestamp 'Notify'
+
+  if [[ ! -z "$HS_NOTIFY_COMMAND" ]]; then
+    eval "$HS_NOTIFY_COMMAND"
+    return
+  fi
+
+  run_hook 'notify' 'pre'
+  case "$HS_NOTIFY_STYLE" in
+    dim)
+      dim_levels=($HS_NOTIFY_DIM_LEVEL)
+      dim_percent=${dim_levels[0]}
+      if (( $battery_status == 1 )); then
+        [[ "${dim_levels[1]}" ]] && dim_percent=${dim_levels[1]}
+      fi
+      set_brightness $dim_percent $HS_NOTIFY_DIM_MILLISECONDS
+      ;;
+
+    fade)
+      set_brightness $HS_NOTIFY_FADE_LEVEL \
+        $(($__HS_SECONDS_UNTIL_SCREEN_OFF * 1000))
+      ;;
+
+    alert)
+      notify-send -t $HS_NOTIFY_MESSAGE_MILLISECONDS \
+        "${HS_NOTIFY_MESSAGE/\%/$__HS_SECONDS_UNTIL_LOCK}"
+      ;;
+
+    countdown)
+      for (( i = $__HS_SECONDS_UNTIL_LOCK; i > 1; i-- )); do
+        notify-send -t 0 "${HS_NOTIFY_MESSAGE/\%/$i}"
+        sleep 1
+      done
+      ;;
+  esac
+  run_hook 'notify' 'post'
+}
+
+
+run_lock() {
+  #
+  # Run lock command.
+  #
+  [[ "$(pidof $HS_LOCK_PROCESS_NAME)" ]] && { return || exit 1; }
+  echo_timestamp 'Lock'
+  trap "send_signal '$HS_LOCK_PAUSE_PROCESS_NAMES' CONT" EXIT RETURN SIGUSR1
+  send_signal "$HS_LOCK_PAUSE_PROCESS_NAMES" STOP
+  run_hook 'lock' 'pre'
+  eval "$HS_LOCK_COMMAND"
+  run_hook 'lock' 'post'
+}
+
+
+run_unlock() {
+  #
+  # Run unlock command.
+  #
+  echo_timestamp 'Unlock'
+  send_signal "$HS_LOCK_PAUSE_PROCESS_NAMES" CONT
+  run_hook 'unlock' 'pre'
+  eval "$HS_UNLOCK_COMMAND"
+  run_hook 'unlock' 'post'
+}
+
+
+run_screen_off() {
+  #
+  # Run screen off command.
+  #
+  echo_timestamp 'Screen off'
+  run_hook 'screen-off' 'pre'
+  eval "$HS_SCREEN_OFF_COMMAND"
+  run_hook 'screen-off' 'post'
+}
+
+
+run_sleep() {
+  #
+  # Run system sleep command.
+  #
+
+  # Prevent immediate sleep after resume.
+  current_seconds=$(date +%s)
+  [[ -f "$HS_SLEEP_FILE" ]] && \
+    (( ( current_seconds - $(<"$HS_SLEEP_FILE") ) <= 5 )) && return 1
+  echo $current_seconds > "$HS_SLEEP_FILE"
+
+  # Run sleep command.
+  echo_timestamp 'Sleep'
+  restore_brightness instant
+  eval "$HS_SLEEP_COMMAND"
+}
+
+
+run_resume() {
+  #
+  # Run resume from sleep command.
+  #
+  echo_timestamp 'Resume'
+  eval "$HS_RESUME_COMMAND"
+}
+
+
+
+#
+# Application functions.
+#
+
+set_timers() {
+  #
+  # Set timers.
+  #
+
+  # Convert time strings to arrays.
+  HS_NOTIFY_SECONDS=($HS_NOTIFY_SECONDS)
+  HS_LOCK_SECONDS=($HS_LOCK_SECONDS)
+  HS_SCREEN_OFF_SECONDS=($HS_SCREEN_OFF_SECONDS)
+  HS_SLEEP_SECONDS=($HS_SLEEP_SECONDS)
+
+  # Default timer values.
+  timers[notify]=${HS_NOTIFY_SECONDS[0]}
+  timers[lock]=${HS_LOCK_SECONDS[0]}
+  timers[screen_off]=${HS_SCREEN_OFF_SECONDS[0]}
+  timers[sleep]=${HS_SLEEP_SECONDS[0]}
+
+  # Secondary values for timers.
+  if (( $battery_status == 1 )); then
+    [[ "${HS_NOTIFY_SECONDS[1]}" ]] && \
+      timers[notify]=${HS_NOTIFY_SECONDS[1]}
+
+    [[ "${HS_LOCK_SECONDS[1]}" ]] && \
+      timers[lock]=${HS_LOCK_SECONDS[1]}
+
+    [[ "${HS_SCREEN_OFF_SECONDS[1]}" ]] && \
+      timers[screen_off]=${HS_SCREEN_OFF_SECONDS[1]}
+
+    [[ "${HS_SLEEP_SECONDS[1]}" ]] && \
+      timers[sleep]=${HS_SLEEP_SECONDS[1]}
+  fi
+
+  # Add five seconds to avoid sleep timer collision with another timer.
+  for timer in "${!timers[@]}"; do
+    [[ $timer = 'sleep' ]] && continue
+    [[ ${timers[$timer]} = ${timers[sleep]} ]] && \
+      timers[sleep]=$(( timers[sleep] + 5 ))
+  done
+}
+
+
+timer() {
+  #
+  # Detect user inactivity and run idle commands.
+  #
+  local flag=0
+  local paused_timers=""
+  local actions=()
+
+  xgetidle ${timers[@]} | \
+  while read -r line; do
+    [[ "$line" ]] || continue
+
+    # Activity timer has been reset.
+    if (( $flag == 1 )) && (( $line == '0' )); then
+      run_restore
+      flag=0
+      continue
+    fi
+
+    # Pausing.
+    paused_timers=$(is_paused)
+    (( $? == 0 )) && [[ -z $paused_timers ]] && xset s reset && continue
+
+    if [[ "$paused_timers" = 'unpaused' ]]; then
+      run_hook 'pause' 'unpause-automatic'
+      rm -f "$HS_PAUSE_FILE"
+      (( $HS_PAUSE_MESSAGE_MILLISECONDS > 0 )) && \
+        notify-send -t $HS_PAUSE_MESSAGE_MILLISECONDS \
+          "Hypersomnia has been automatically unpaused."
+    fi
+
+    # Run action based on idle time seconds.
+    for timer in "${timers[@]}"; do
+      (( $line == $timer )) || continue
+      is_inhibited ${HS_INHIBITORS[@]} && break
+
+      actions=()
+      for timer_name in "${!timers[@]}"; do
+        (( ${timers[$timer_name]} == $timer )) && actions+=("${timer_name}")
+      done
+
+      for action in "${actions[@]}"; do
+        case "$action" in
+          # Launch notifier after inactivity.
+          notify)
+            [[ "$paused_timers" = *'notify'* ]] && break
+            is_inhibited ${HS_NOTIFY_INHIBITORS[@]} && break
+            run_notify &
+            echo -n "$! " >> "$HS_TEMP_PID_FILE"
+            ;;
+
+          # Launch lock after inactivity.
+          lock)
+            [[ "$paused_timers" = *'lock'* ]] && break
+            is_inhibited ${HS_LOCK_INHIBITORS[@]} && break
+            run_lock &
+            ;;
+
+          # Turn screen off after inactivity.
+          screen_off)
+            [[ "$paused_timers" = *'screen-off'* ]] && break
+            is_inhibited ${HS_SCREEN_OFF_INHIBITORS[@]} && break
+            run_screen_off &
+            ;;
+
+          # Sleep after inactivity.
+          sleep)
+            [[ "$paused_timers" = *'sleep'* ]] && break
+            is_inhibited ${HS_SLEEP_INHIBITORS[@]} && break
+            run_sleep &
+            ;;
+        esac
+      done
+
+      flag=1
+      break
+    done
+  done &
+
+  echo "$!" > "$HS_XGETIDLE_PID_FILE"
+}
+
+
+calculate_delays() {
+  #
+  # Calculate delays in timers.
+  #
+  local notify=${timers[notify]}
+  local screen_off=${timers[screen_off]}
+  local lock=${timers[lock]}
+
+  # Calculate seconds until screen turns off, needed for fading.
+  [[ "$screen_off" ]] && [[ "$notify" ]] && (( $screen_off > $notify )) && \
+    __HS_SECONDS_UNTIL_SCREEN_OFF=$(( $screen_off - $notify ))
+
+  # Calculate seconds until lock is activated.
+  [[ "$lock" ]] && [[ "$notify" ]] && (( $lock > $notify )) && \
+    __HS_SECONDS_UNTIL_LOCK=$(( $lock - $notify ))
+}
+
+
+run_message() {
+  #
+  # Print message on run.
+  #
+  echo "Process ID:|$$"
+  echo "Started on:|$(date)"
+  echo '|'
+  echo -n 'Status:|'
+  (( $battery_status == 1 )) && echo 'Discharging' || echo 'Charging'
+  [[ "${HS_INHIBITORS[@]}" ]] && echo -e "Inhibitors:|${HS_INHIBITORS[@]}"
+  echo '|'
+
+  # Print timers.
+  local timer_name=
+  local timer_value=
+  local unsorted_timers=
+  for timer in "${!timers[@]}"; do
+    (( ${timers[$timer]} < 1 )) && continue
+    timer_name="${timer^}"
+    timer_inhibitor_name="HS_${timer^^}_INHIBITORS[@]"
+    unsorted_timers+="${timer_name/_/ }:|${timers[$timer]} seconds"
+    [[ "${!timer_inhibitor_name}" ]] && \
+      unsorted_timers+=" (${!timer_inhibitor_name})"
+    unsorted_timers+='\n'
+  done
+  echo -e "${unsorted_timers}" | sort -t '|' -k2 -V
+}
+
+
+clean() {
+  #
+  # Clean up processes and files.
+  #
+  kill \
+    $(jobs -p) \
+    $(echo $(<"$HS_CHARGING_WATCH_PID_FILE")) \
+    $(echo $(<"$HS_TEMP_PID_FILE")) \
+    $(echo $(<"$HS_MONITOR_PID_FILE")) \
+    $(echo $(<"$HS_XGETIDLE_PID_FILE"))
+
+  rm -f \
+    "$HS_PID_FILE" \
+    "$HS_CHARGING_WATCH_PID_FILE" \
+    "$HS_MONITOR_PID_FILE" \
+    "$HS_TEMP_PID_FILE" \
+    "$HS_XGETIDLE_PID_FILE" \
+    "$HS_RUN_MESSAGE_FILE" \
+    "$HS_PAUSE_FILE" \
+    "$HS_SLEEP_FILE"
+
+  send_signal "$HS_BRIGHTNESS_PAUSE_PROCESS_NAMES" CONT
+  send_signal "$HS_LOCK_PAUSE_PROCESS_NAMES" CONT
+
+  rm -f "$HS_BRIGHTNESS_LOCK"
+  restore_brightness instant
+  rm -f \
+    "$HS_BRIGHTNESS_FILE" \
+    "$HS_BRIGHTNESS_LOCK"
+}
+
+
+watch() {
+  #
+  # Restart program on watched file change.
+  # Note: inotifywait does not work to watch modification of battery status.
+  #
+  [[ -f "$HS_CHARGING_WATCH_FILE" ]] || return
+
+  local previous_data="$(<"$HS_CHARGING_WATCH_FILE")"
+  local current_data=
+  while true; do
+    current_data="$(<"$HS_CHARGING_WATCH_FILE")"
+    [[ "$current_data" = "$previous_data" ]] || break
+    previous_data=$current_data
+    sleep $HS_CHARGING_WATCH_INTERVAL
+  done
+  echo "$!" > "$HS_CHARGING_WATCH_PID_FILE"
+  wait; kill -s SIGUSR1 $$
+}
+
+
+monitor_receive() {
+  #
+  # Process received dbus signals.
+  #
+  case "$1" in
+    Lock)
+      run_lock &
+      ;;
+
+    Unlock)
+      run_unlock &
+      ;;
+
+    PrepareForSleep)
+      if [[ "$2" = *'true' ]]; then
+        [[ "$HS_LOCK_ON_SLEEP" = 'true' ]] && run_lock &
+        run_hook 'sleep' 'pre'
+      elif [[ "$2" = *'false' ]]; then
+        sleep 1
+        run_resume
+        run_hook 'sleep' 'post'
+      fi
+      ;;
+  esac
+}
+
+
+monitor() {
+  #
+  # Monitor DBus.
+  #
+  local flag=0
+  local member=
+  dbus-monitor --system \
+    'type=signal,member=Lock' \
+    'type=signal,member=Unlock' \
+    'type=signal,member=PrepareForSleep' 2> /dev/null | \
+  while read -r line; do
+    # Get next line when necessary
+    (( $flag == 1 )) && flag=0 && monitor_receive "$member" "$line"
+
+    # Ignore non-signals
+    [[ $line != signal* ]] && continue
+
+    line=${line##*interface=}
+    line=(${line/; member=/ })
+
+    case "${line[@]}" in
+      # Locking
+      'org.freedesktop.login1.Session '*)
+        monitor_receive "${line[1]}"
+        ;;
+
+      # Sleeping
+      'org.freedesktop.login1.Manager PrepareForSleep')
+        member="${line[1]}"
+        flag=1  # Next iteration will pass to monitor_receive.
+        ;;
+    esac
+  done &
+  echo "$!" > "$HS_MONITOR_PID_FILE"
+}
+
+
+main() {
+  #
+  # Run Hypersomnia.
+  #
+
+  # Create directories.
+  mkdir -p $HS_CONFIG_PATH
+
+  # Disallow multiple instances.
+  if [[ -f "$HS_PID_FILE" ]] && kill -0 $(<"$HS_PID_FILE"); then
+    echo -e "\e[7mHypersomnia is already running.\e[0m"
+    echo -e "Run \`$0 -r\` to reload."
+    echo -e "Run \`$0 -k\` to kill."
+    echo -e "Run \`$0 -h\` for help.\n"
+    echo -e "$(<"$HS_RUN_MESSAGE_FILE")"
+    exit 1
+  else
+    clean > /dev/null 2>&1
+  fi
+
+  # Disable X screensaver feature.
+  xset s off
+
+  # Set trap and store PID.
+  trap 'clean > /dev/null 2>&1' EXIT RETURN SIGUSR1
+  echo -n $$ > "$HS_PID_FILE"
+
+  # Set timers and calculate delays between events.
+  get_battery_status
+  set_timers
+  calculate_delays
+
+  # Print running status.
+  message="$__name\n"
+  message+=$(run_message | column -t -s '|')
+  echo -e "$message\n"
+  echo "Run \`$0 -h\` for help."
+
+  # Write message to file.
+  echo "$message" > "$HS_RUN_MESSAGE_FILE"
+
+  # Run main timer.
+  timer
+
+  # Run monitor and watcher.
+  monitor
+  watch "$HS_CHARGING_WATCH_FILE" &
+
+  # Wait for all bg processes to finish and re-run script.
+  wait
+  exec "$(realpath "$0")"
+}
+
+
+requirements() {
+  #
+  # Print requirements and show if they are installed.
+  #
+  echo -e "$__name\n"
+  echo -e '\e[4mRequired packages:\e[0m'
+
+  # libX11
+  echo -n 'libX11: '
+  ldconfig -p | grep -c 'libX11.so' > /dev/null 2>&1 && \
+    echo 'Installed' || echo 'Missing'
+
+  # libXss
+  echo -n 'libXss: '
+  ldconfig -p | grep -c 'libXss.so' > /dev/null 2>&1 && \
+    echo 'Installed' || echo 'Missing'
+
+  # realpath
+  echo -n 'realpath: '
+  realpath --version > /dev/null 2>&1 && \
+    echo 'Installed' || echo 'Missing'
+
+  # bc
+  echo -n 'bc: '
+  bc -v > /dev/null 2>&1 && \
+    echo 'Installed' || echo 'Missing'
+
+  echo -e '\n\e[4mRecommended packages:\e[0m'
+
+  # xbacklight
+  echo -n 'xbacklight: '
+  xbacklight -version > /dev/null 2>&1 && \
+    echo 'Installed' || echo 'Missing'
+
+  # i3lock
+  echo -n 'i3lock: '
+  i3lock -v > /dev/null 2>&1 && \
+    echo 'Installed' || echo 'Missing'
+}
+
+
+usage() {
+  #
+  # Print usage details.
+  #
+  echo -e "$__name"
+  echo
+  echo 'A Power Manager for Linux.'
+  echo
+  echo -e "\e[4musage:\e[0m $0 [-h]"
+  echo
+  echo -e '\e[4moptional arguments:\e[0m'
+  echo '  --help'
+  echo '    Print usage instructions.'
+  echo
+  echo '  --options'
+  echo "    Print Hypersomnia's default options."
+  echo
+  echo '  --hooks'
+  echo "    Print Hypersomnia's hooks."
+  echo
+  echo '  --requirements'
+  echo '    Print required dependencies.'
+  echo
+  echo '  --notify'
+  echo '    Immediately run the notifier command.'
+  echo
+  echo '  --lock'
+  echo '    Immediately run the lock command.'
+  echo
+  echo '  --screen-off'
+  echo '    Immediately run the screen off command.'
+  echo
+  echo '  --sleep'
+  echo '    Immediately run the sleep command.'
+  echo
+  echo '  --resume'
+  echo '    Immediately run the resume command.'
+  echo
+  echo '  --brightness, -b'
+  echo '    Restore brightness to the contents of `$HS_BRIGHTNESS_FILE`.'
+  echo
+  echo '  --max-brightness, -B'
+  echo '    Set brightness to 100%.'
+  echo
+  echo '  --reload, -r'
+  echo '    Reload Hypersomnia.'
+  echo
+  echo '  --daemon, -d'
+  echo '    Run Hypersomnia as a daemon.'
+  echo
+  echo '  --kill, -k'
+  echo '    Kill Hypersomnia.'
+  echo
+  echo '  --pid'
+  echo '    List all Hypersomnia process IDs.'
+  echo
+  echo '  --inhibitors, -i'
+  echo '    List which inhibitors are active.'
+  echo
+  echo '  --pause <duration> [timers...], -p'
+  echo '    Pause Hypersomnia for a specified duration. Specify a duration'
+  echo '    such as `1:05` for 1 hour and 5 minutes. Valid formats are: H:M:S,'
+  echo '    H:M, M. Timers can be individually paused by specifying the timers'
+  echo '    name after the duration. For example, `screen-off sleep` after the'
+  echo '    duration will pause the screen-off and sleep timers but the other'
+  echo '    timers will still activate as normal.'
+  echo
+  echo '  --unpause, -u'
+  echo '    Unpause or clear paused status for Hypersomnia.'
+  echo
+  echo '  --status, -s'
+  echo '    Print status of Hypersomnia.'
+  echo
+  echo '  --version, -v'
+  echo '    Print version.'
+}
+
+
+options() {
+  #
+  # Print options.
+  #
+  echo -e "$__name\n"
+  echo -e '\e[4moptions:\e[0m'
+  echo '  HS_CONFIG_PATH:' $HS_CONFIG_PATH
+  echo '    Path of configuration directory.'
+  echo
+  echo '  HS_CONFIG_FILE:' $HS_CONFIG_FILE
+  echo '    Path of file to source before running.'
+  echo
+  echo '  HS_CACHE_PATH:' $HS_CACHE_PATH
+  echo '    Path of cache directory.'
+  echo
+  echo '  HS_PID_FILE:' $HS_PID_FILE
+  echo "    Path or filename of PID store file."
+  echo
+  echo '  HS_TEMP_PID_FILE:' $HS_TEMP_PID_FILE
+  echo '    Path or filename of temporary PID store file.'
+  echo
+  echo '  HS_XGETIDLE_PID_FILE:' $HS_XGETIDLE_PID_FILE
+  echo "    Path or filename of xgetidle PID store file."
+  echo
+  echo '  HS_RUN_MESSAGE_FILE:' $HS_RUN_MESSAGE_FILE
+  echo '    Path or filename of run message store file.'
+  echo
+  echo '  HS_PAUSE_FILE:' $HS_PAUSE_FILE
+  echo "    Path or filename of pause time store file."
+  echo
+  echo '  HS_SLEEP_FILE:' $HS_SLEEP_FILE
+  echo "    Path or filename of sleep time store file."
+  echo
+  echo "  HS_NOTIFY_SECONDS: '${HS_NOTIFY_SECONDS[@]}'"
+  echo '    Seconds to delay until the notifier is activated. Value must be an'
+  echo '    integer or two integers separated by a space. Use the second value'
+  echo '    in the string to set a secondary value to change to based on the'
+  echo '    watch status. For example, "60 30" will set the notify delay to'
+  echo '    60 seconds of inactivity when watch comparison is false (on AC),'
+  echo '    or 30 seconds for when watch comparison is true.'
+  echo
+  echo "  HS_LOCK_SECONDS: '${HS_LOCK_SECONDS[@]}'"
+  echo '    Seconds to delay until the lock command is executed. Value'
+  echo '    must be an integer or two integers separated by a space. See'
+  echo '    `HS_NOTIFY_SECONDS` for more details.'
+  echo
+  echo "  HS_SCREEN_OFF_SECONDS: '${HS_SCREEN_OFF_SECONDS[@]}'"
+  echo '    Seconds to delay until the screen off command is executed. Value'
+  echo '    must be an integer or two integers separated by a space. See'
+  echo '    `HS_NOTIFY_SECONDS` for more details.'
+  echo
+  echo "  HS_SLEEP_SECONDS: '${HS_SLEEP_SECONDS[@]}'"
+  echo '    Seconds to delay until the sleep command is executed. Value must'
+  echo '    be an integer or two integers separated by a space. See'
+  echo '    `HS_NOTIFY_SECONDS` for more details.'
+  echo
+  echo '  HS_NOTIFY_COMMAND:' ${HS_NOTIFY_COMMAND:-unset}
+  echo '    Override the default notify command.'
+  echo
+  echo '  HS_LOCK_COMMAND:' $HS_LOCK_COMMAND
+  echo '    Override the default lock command.'
+  echo
+  echo '  HS_UNLOCK_COMMAND:' $HS_UNLOCK_COMMAND
+  echo '    Override the default unlock command.'
+  echo
+  echo '  HS_SCREEN_OFF_COMMAND:' $HS_SCREEN_OFF_COMMAND
+  echo '    Override the default screen off command.'
+  echo
+  echo '  HS_SLEEP_COMMAND:' $HS_SLEEP_COMMAND
+  echo '    Override the default sleep command.'
+  echo
+  echo '  HS_RESUME_COMMAND:' $HS_RESUME_COMMAND
+  echo '    Override the default resume command.'
+  echo
+  echo '  HS_LOCK_PAUSE_PROCESS_NAMES:' $HS_LOCK_PAUSE_PROCESS_NAMES
+  echo '    Processes to pause when running lock command. Value must be a'
+  echo '    string of process names separated by spaces.'
+  echo
+  echo '  HS_NOTIFY_STYLE:' $HS_NOTIFY_STYLE
+  echo '    Style of notifier.'
+  echo '    Options:'
+  echo '      dim       - dim screen to percent.'
+  echo '      fade      - fade screen to off.'
+  echo '      alert     - send one notification.'
+  echo '      countdown - send notifications in countdown format until lock'
+  echo '                  command is activated.'
+  echo
+  echo '  HS_NOTIFY_DIM_MILLISECONDS:' $HS_NOTIFY_DIM_MILLISECONDS
+  echo '    Duration of screen dimming. Only applies to the dim notify style.'
+  echo
+  echo '  HS_NOTIFY_DIM_LEVEL:' $HS_NOTIFY_DIM_LEVEL
+  echo '    Brightness level to dim to. Only applies to the dim notify style.'
+  echo '    Use a positive value to dim to an absolute percent; or use a'
+  echo '    negative value to dim relative to the current screen brightness.'
+  echo '    A second value can be set to be used when status is discharging.'
+  echo
+  echo '  HS_NOTIFY_FADE_LEVEL:' $HS_NOTIFY_FADE_LEVEL
+  echo '    Brightness level to fade to. Only applies to the fade notify style.'
+  echo '  HS_NOTIFY_MESSAGE:' $HS_NOTIFY_MESSAGE
+  echo '    Message to print before locking. Use a percent symbol (%) to'
+  echo '    indiciate amount of seconds remaining. Only applies to alert and'
+  echo '    countdown notify styles.'
+  echo
+  echo '  HS_NOTIFY_MESSAGE_MILLISECONDS:' $HS_NOTIFY_MESSAGE_MILLISECONDS
+  echo '    Duration of notification message. Only applies to alert and'
+  echo '    countdown notify styles.'
+  echo
+  echo '  HS_PAUSE_MESSAGE_MILLISECONDS:' $HS_PAUSE_MESSAGE_MILLISECONDS
+  echo '    Duration of pause notification message. Set to `0` to disable.'
+  echo
+  echo '  HS_LOCK_PROCESS_NAME:' $HS_LOCK_PROCESS_NAME
+  echo '    Locker process name to check if the locker is already running.'
+  echo
+  echo '  HS_CHARGING_WATCH_INTERVAL:' $HS_CHARGING_WATCH_INTERVAL
+  echo '    Interval between watch file reads. Set to `0` to disable.'
+  echo
+  echo '  HS_CHARGING_WATCH_FILE:' $HS_CHARGING_WATCH_FILE
+  echo '    Path of file to watch for changes. File must exist or watch will'
+  echo '    not be enabled.'
+  echo
+  echo '  HS_CHARGING_WATCH_VALUE:' $HS_CHARGING_WATCH_VALUE
+  echo "    Value to compare the watch file's value against."
+  echo
+  echo '  HS_CHARGING_WATCH_PID_FILE:' $HS_CHARGING_WATCH_PID_FILE
+  echo "    Path or filename of watch PID store file."
+  echo
+  echo '  HS_BRIGHTNESS_FILE:' $HS_BRIGHTNESS_FILE
+  echo '    Path or filename brightness level store file.'
+  echo
+  echo '  HS_BRIGHTNESS_STEPS:' $HS_BRIGHTNESS_STEPS
+  echo '    Amount of steps each second between two brightness levels.'
+  echo -e '    \e[7;5mWarning:\e[27;25m udev may spam backlight brightness changes'
+  echo '    when using xbacklight, even after the canceller kills the notifier.'
+  echo '    This may make your CPU spike for a period of time. Check by running'
+  echo '    `udevadm monitor` and running the notify command. If this happens'
+  echo '    use `$HS_BRIGHTNESS_FIXED_STEPS` instead.'
+  echo
+  echo '  HS_BRIGHTNESS_FIXED_STEPS:' ${HS_BRIGHTNESS_FIXED_STEPS:-unset}
+  echo '    Fixed amount of steps between two brightness levels.'
+  echo
+  echo '  HS_BRIGHTNESS_PAUSE_PROCESS_NAMES:' $HS_BRIGHTNESS_PAUSE_PROCESS_NAMES
+  echo '    Processes to pause when brightness is being set. Value must be a'
+  echo '    string of process names separated by spaces.'
+  echo
+  echo "  HS_INHIBITORS: '${HS_INHIBITORS[@]}'"
+  echo '    Prevent all timers from activating when criteria is met. Value must'
+  echo '    be a string separated by values.'
+  echo '    Options:'
+  echo '      fullscreen - window is fullscreen'
+  echo '      audio      - audio is playing'
+  echo '      cpu        - CPU utilization >= `$HS_INHIBIT_CPU_VALUE` percent'
+  echo '      network    - network traffic >= `$HS_INHIBIT_NETWORK_VALUE` bytes'
+  echo '      custom     - custom inhibit command in `$HS_INHIBIT_CUSTOM_COMMAND`'
+  echo
+  echo "  HS_NOTIFY_INHIBITORS: '${HS_NOTIFY_INHIBITORS[@]}'"
+  echo '    Prevent notify timer from activating when criteria is met. Value'
+  echo '    must be a string of values separated by spaces. See'
+  echo '    `$HS_INHIBITORS` for options.'
+  echo
+  echo "  HS_LOCK_INHIBITORS: '${HS_LOCK_INHIBITORS[@]}'"
+  echo '    Prevent lock timer from activating when criteria is met. Value'
+  echo '    must be a string of values separated by spaces. See'
+  echo '    `$HS_INHIBITORS` for options.'
+  echo
+  echo "  HS_SCREEN_OFF_INHIBITORS: '${HS_SCREEN_OFF_INHIBITORS[@]}'"
+  echo '    Prevent screen off timer from activating when criteria is met.'
+  echo '    Value must be a string of values separated by spaces. See'
+  echo '    `$HS_INHIBITORS` for options.'
+  echo
+  echo "  HS_SLEEP_INHIBITORS: '${HS_SLEEP_INHIBITORS[@]}'"
+  echo '    Prevent sleep timer from activating when criteria is met. Value'
+  echo '    must be a string of values separated by spaces. See'
+  echo '    `$HS_INHIBITORS` for options.'
+  echo
+  echo '  HS_INHIBIT_NETWORK_VALUE:' $HS_INHIBIT_NETWORK_VALUE
+  echo '    Value for inhibitor to check against for network traffic.'
+  echo '    Value must be in bytes; for example: `1000000` is roughly 1MB/second.'
+  echo
+  echo "  HS_INHIBIT_CUSTOM_COMMAND: ${HS_INHIBIT_CUSTOM_COMMAND:-unset}"
+  echo '    Value for inhibitor to check against for custom user inhibitor.'
+  echo '    Value must be a string command. Exit status must be a successful `0`'
+  echo '    to inhibit timers.'
+  echo
+  echo '  HS_INHIBIT_CPU_VALUE:' $HS_INHIBIT_CPU_VALUE
+  echo '    Value for inhibitor to check against for CPU utilization.'
+  echo '    Value must be an integer. Example: 50 for 50%'
+  echo
+  echo "  HS_NETWORK_DEVICE: ${HS_NETWORK_DEVICE%:}"
+  echo '    Device to monitor for network rate. The device will attempt to be'
+  echo '    found automatically if the variable is left unset.'
+  echo
+  echo '  HS_LOCK_ON_SLEEP:' $HS_LOCK_ON_SLEEP
+  echo '    Activate lock when sleep is activated. Value must be a boolean.'
+}
+
+
+hooks() {
+  #
+  # Print hooks.
+  #
+  echo -e "$__name\n"
+  echo -e '\e[4mhooks:\e[0m'
+  echo '  Hook scripts must be placed in $HS_CONFIG_PATH.'
+  echo "  ($HS_CONFIG_PATH)"
+  echo
+  echo '  $HS_CONFIG_PATH/notify.sh'
+  echo '    pre  -- command to run before notifying.'
+  echo '    post -- command to run after notifying.'
+  echo
+  echo '  $HS_CONFIG_PATH/lock.sh'
+  echo '    pre  -- command to run before locking.'
+  echo '    post -- command to run after unlocking.'
+  echo
+  echo '  $HS_CONFIG_PATH/screen-off.sh'
+  echo '    pre  -- command to run before screen is turned off.'
+  echo '    post -- command to run after screen is turned off.'
+  echo
+  echo '  $HS_CONFIG_PATH/sleep.sh'
+  echo '    pre  -- command to run before system goes to sleep.'
+  echo '    post -- command to run after system is resumed.'
+  echo
+  echo '  $HS_CONFIG_PATH/pause.sh'
+  echo '    pause             -- command to run when paused.'
+  echo '    unpause-manual    -- command to run when manually unpaused.'
+  echo '    unpause-automatic -- command to run when automatically unpaused.'
+}
+
+
+
+#
+# Application.
+#
+
+# Run program if no args.
+(( $# < 1 )) && main && exit 0
+
+
+
+#
+# Options.
+#
+
+case "$1" in
+  # Print requirements.
+  --requirements)
+    requirements
+    ;;
+
+  # Run notify command for testing.
+  --notify)
+    __HS_SECONDS_UNTIL_LOCK=5
+    __HS_SECONDS_UNTIL_SCREEN_OFF=5
+    trap 'run_restore' RETURN EXIT SIGUSR1
+    get_battery_status
+    run_notify & wait
+    ;;
+
+  # Run lock command.
+  --lock | -l)
+    run_lock
+    ;;
+
+  # Run screen off command.
+  --screen-off)
+    run_screen_off
+    ;;
+
+  # Run sleep command.
+  --sleep)
+    run_sleep
+    ;;
+
+  # Run resume command.
+  --resume)
+    run_resume
+    ;;
+
+  # Restore brightness to value in $HS_BRIGHTNESS_FILE.
+  --brightness | -b)
+    get_battery_status
+    [[ "$2" ]] && [[ "${2:1}" != '-' ]] && \
+      set_brightness $2 ${3:-2000} || restore_brightness
+    ;;
+
+  # Set brightness to 100.
+  --max-brightness | -B)
+    get_battery_status
+    set_brightness 100 500
+    ;;
+
+  # Reload Hypersomnia and friends.
+  --reload | -r)
+    [[ -f "$HS_PID_FILE" ]] && { kill -s SIGUSR1 $(<"$HS_PID_FILE") && exit 0; }
+    pids="$(get_running_pids -o)"
+    kill -s SIGUSR1 ${pids/$$} 2> /dev/null
+    ;;
+
+  # Run Hypersomnia as a daemon.
+  --daemon | -d)
+    $(realpath "$0") & disown
+    exit 0
+    ;;
+
+  # Kill Hypersomnia and friends.
+  --kill | -k)
+    [[ -f "$HS_PID_FILE" ]] && { kill -s SIGTERM $(<"$HS_PID_FILE") && exit 0; }
+    pids="$(get_running_pids)"
+    kill -s SIGTERM ${pids/$$} 2> /dev/null
+    ;;
+
+  # Show PIDs for Hypersomnia processes.
+  --pid)
+    get_running_pids
+    ;;
+
+  # Show inhibitor status.
+  --inhibitors | -i)
+    is_command_successful && echo 'Custom' && inhibit_flag=1
+    is_audio_playing && echo 'Audio' && inhibit_flag=1
+    is_cpu_busy && echo 'CPU' && inhibit_flag=1
+    is_network_busy && echo 'Network' && inhibit_flag=1
+    is_window_fullscreen && echo 'Fullscreen' && inhibit_flag=1
+    is_paused && echo 'Paused' && inhibit_flag=1
+    [[ -n "$inhibit_flag" ]] && exit 1
+    ;;
+
+  # Pause Hypersomnia.
+  --pause | -p)
+    [[ -z $2 ]] && echo -e "$__name\nMissing argument." && exit 1
+    set_pause ${@:2}
+    ;;
+
+  # Unpause Hypersomnia.
+  --unpause | -u)
+    set_pause 0
+    ;;
+
+  # Print status.
+  --status | -s)
+    if [[ -f "$HS_PAUSE_FILE" ]]; then
+      pause_data=($(<"$HS_PAUSE_FILE"))
+      pause_until=$(( ${pause_data[0]} - $(date +%s) ))
+      if (( $pause_until > 0 )); then
+        echo 'PAUSED' $pause_until ${pause_data[@]}
+        exit 0
+      fi
+    fi
+
+    [[ "$(get_running_pids)" ]] && echo 'RUNNING' || echo 'NOT RUNNING'
+    ;;
+
+  # Print options.
+  --options)
+    options
+    ;;
+
+  # Print hooks.
+  --hooks)
+    hooks
+    ;;
+
+  # Print version.
+  --version | -v | -V)
+    echo $version
+    ;;
+
+  # Print help/usage.
+  *)
+    usage
+    exit 0
+    ;;
+esac
+
+
+exit 0
