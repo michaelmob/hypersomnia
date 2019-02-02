@@ -1,3 +1,5 @@
+**Hypersomnia is now deprecated. Please use the more-versatile program [idlelock.sh](https://github.com/thetarkus/idlelock.sh) for your screen locking needs.**
+
 # 🌜 Hypersomnia
 Power Manager for Linux.
 
